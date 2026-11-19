@@ -1,0 +1,7 @@
+{
+  "instructions": ["AGENTS.md", "skills/tdd-workflow/SKILL.md"],
+  "agent": {
+    "build": {"description": "Primary agent", "mode": "primary"},
+    "planner": {"description": "Planning specialist", "mode": "subagent", "prompt": "{file:prompts/agents/planner.txt}"}
+  }
+}

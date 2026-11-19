@@ -1,0 +1,286 @@
+#!/usr/bin/env python3
+"""Complete an ECC repository -> OpenCode agent conversion, offline.
+
+Upstream: affaan-m/ECC.  Issue #4027: 46 of 72 agents in agents/ are never
+registered in .opencode/opencode.json, so commands that name them silently
+fall back.  Issue #4029: installed instructions reference files that the
+home install never writes.
+
+This tool is independent. It reads the upstream checkout's public files only.
+It never edits the checkout; `emit` writes a complete drop-in directory.
+"""
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import sys
+from pathlib import Path
+
+SCHEMA_AGENT = "ecc-opencode-agent-complete/v1"
+
+
+def fail(msg, code=2):
+    print("error: " + msg, file=sys.stderr)
+    return code
+
+
+def read_text(path):
+    return Path(path).read_text(encoding="utf-8")
+
+
+def split_frontmatter(text):
+    """Return (meta dict, body str). Only simple `key: value` lines."""
+    meta = {}
+    if text.startswith("---"):
+        parts = text.split("\n")
+        end = None
+        for i in range(1, len(parts)):
+            if parts[i].strip() == "---":
+                end = i
+                break
+        if end is not None:
+            for line in parts[1:end]:
+                if ":" in line and not line.startswith((" ", "\t")):
+                    k, v = line.split(":", 1)
+                    meta[k.strip()] = v.strip()
+            body = "\n".join(parts[end + 1:])
+            return meta, body.lstrip("\n")
+    return meta, text
+
+
+def prompt_file_ref(value):
+    m = re.search(r"\{file:([^}]+)\}", value or "")
+    return m.group(1) if m else None
+
+
+def load_agents(repo):
+    agents = {}
+    for p in sorted((repo / "agents").glob("*.md")):
+        meta, body = split_frontmatter(read_text(p))
+        agents[p.stem] = {
+            "description": meta.get("description", ""),
+            "model": meta.get("model", ""),
+            "body": body,
+            "path": p,
+        }
+    return agents
+
+
+def load_config(repo, config_rel):
+    return json.loads(read_text(repo / config_rel))
+
+
+def command_refs(repo, known_agents):
+    """Frontmatter agent: plus backticked agent names in the body."""
+    out = {}
+    cmd_dir = repo / "commands"
+    if not cmd_dir.is_dir():
+        return out
+    for p in sorted(cmd_dir.glob("*.md")):
+        text = read_text(p)
+        meta, body = split_frontmatter(text)
+        refs = set()
+        if meta.get("agent"):
+            refs.add(meta["agent"].strip())
+        for token in re.findall(r"`([a-z0-9][a-z0-9-]{1,60})`", body):
+            if token in known_agents:
+                refs.add(token)
+        if refs:
+            out[p.stem] = sorted(refs)
+    return out
+
+
+def resolve_instructions(config, config_dir):
+    missing = []
+    for item in config.get("instructions", []):
+        path = (config_dir / item).resolve()
+        if not path.exists():
+            missing.append(item)
+    return missing
+
+
+def check(repo, config_rel):
+    cfg = load_config(repo, config_rel)
+    config_dir = (repo / config_rel).parent
+    agents = load_agents(repo)
+    registered = set(cfg.get("agent", {}))
+    missing = sorted(set(agents) - registered)
+    # `build` is a built-in primary agent with no agents/*.md file.
+    stale = sorted(registered - set(agents) - {"build"})
+    prompt_missing = []
+    for name, entry in cfg.get("agent", {}).items():
+        ref = prompt_file_ref(entry.get("prompt", ""))
+        if ref and not (config_dir / ref).exists():
+            prompt_missing.append(name)
+    refs = command_refs(repo, agents)
+    affected = {}
+    for cmd, names in refs.items():
+        bad = [n for n in names if n in missing]
+        if bad:
+            affected[cmd] = bad
+    instr_missing = resolve_instructions(cfg, config_dir)
+    return {
+        "schema": SCHEMA_AGENT,
+        "repo_agents": len(agents),
+        "registered_agents": len(registered),
+        "missing_agents": missing,
+        "missing_agent_count": len(missing),
+        "registered_without_source": stale,
+        "agents_with_missing_prompt": sorted(prompt_missing),
+        "commands_with_missing_agents": affected,
+        "commands_affected": len(affected),
+        "missing_instructions": instr_missing,
+        "ok": not (missing or stale or prompt_missing or affected or instr_missing),
+    }
+
+
+def emit(repo, config_rel):
+    cfg = load_config(repo, config_rel)
+    config_dir = (repo / config_rel).parent
+    agents = load_agents(repo)
+    result = check(repo, config_rel)
+    emitted = []
+    for name in result["missing_agents"]:
+        entry = cfg.setdefault("agent", {}).setdefault(name, {})
+        entry["description"] = agents[name]["description"]
+        entry.setdefault("mode", "subagent")
+        entry["prompt"] = "{file:prompts/agents/%s.txt}" % name
+        emitted.append(name)
+    prompts = {name: agents[name]["body"] for name in emitted}
+    manifest = {
+        "schema": SCHEMA_AGENT,
+        "upstream_agents_dir": "agents",
+        "config": config_rel,
+        "emitted": emitted,
+        "count": len(emitted),
+        "sha256": {n: hashlib.sha256(prompts[n].encode("utf-8")).hexdigest()
+                   for n in emitted},
+    }
+    return cfg, prompts, manifest, result
+
+
+def cmd_check(args):
+    repo = Path(args.repo)
+    if not (repo / args.config).is_file():
+        return fail("config not found: %s" % (repo / args.config))
+    res = check(repo, args.config)
+    if args.json:
+        print(json.dumps(res, indent=2, sort_keys=True))
+    else:
+        print("agents: %d repo / %d registered / %d missing"
+              % (res["repo_agents"], res["registered_agents"],
+                 res["missing_agent_count"]))
+        for n in res["missing_agents"]:
+            print("  missing agent: " + n)
+        if res["commands_with_missing_agents"]:
+            print("commands whose named agents are unregistered: %d"
+                  % res["commands_affected"])
+        for n in res["missing_instructions"]:
+            print("  missing instruction: " + n)
+    return 0 if res["ok"] else 1
+
+
+def cmd_emit(args):
+    repo = Path(args.repo)
+    if not (repo / args.config).is_file():
+        return fail("config not found: %s" % (repo / args.config))
+    cfg, prompts, manifest, res = emit(repo, args.config)
+    out = Path(args.out)
+    (out / "prompts" / "agents").mkdir(parents=True, exist_ok=True)
+    for name, body in prompts.items():
+        (out / "prompts" / "agents" / (name + ".txt")).write_text(
+            body, encoding="utf-8")
+    (out / "opencode.json").write_text(
+        json.dumps(cfg, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    copied_prompts, copied_instructions = [], []
+    for entry in cfg.get("agent", {}).values():
+        ref = prompt_file_ref(entry.get("prompt", ""))
+        src = (repo / args.config).parent / ref if ref else None
+        if ref and src.is_file() and not (out / ref).exists():
+            (out / ref).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, out / ref)
+            copied_prompts.append(ref)
+    for item in res["missing_instructions"]:
+        src = repo / item
+        if src.is_file():
+            (out / item).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, out / item)
+            copied_instructions.append(item)
+    manifest["copied_existing_prompts"] = sorted(copied_prompts)
+    manifest["copied_instructions"] = sorted(copied_instructions)
+    (out / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    if args.json:
+        print(json.dumps(manifest, indent=2, sort_keys=True))
+    else:
+        print("emitted %d agents, %d prompt files -> %s"
+              % (manifest["count"], len(prompts), out))
+        if res["missing_instructions"]:
+            print("warning: %d instructions still unresolved in the checkout"
+                  % len(res["missing_instructions"]))
+    return 0 if manifest["count"] or res["ok"] else 1
+
+
+def cmd_verify_install(args):
+    install = Path(args.install)
+    cfg_path = install / "opencode.json"
+    if not cfg_path.is_file():
+        return fail("opencode.json not found in %s" % install)
+    cfg = json.loads(read_text(cfg_path))
+    missing_prompts = []
+    for name, entry in cfg.get("agent", {}).items():
+        ref = prompt_file_ref(entry.get("prompt", ""))
+        if ref and not (install / ref).exists():
+            missing_prompts.append({"agent": name, "file": ref})
+    missing_instructions = resolve_instructions(cfg, install)
+    res = {
+        "schema": SCHEMA_AGENT,
+        "install": str(install),
+        "missing_agent_prompts": missing_prompts,
+        "missing_instructions": missing_instructions,
+        "ok": not (missing_prompts or missing_instructions),
+    }
+    if args.json:
+        print(json.dumps(res, indent=2, sort_keys=True))
+    else:
+        print("install: %s" % install)
+        print("missing agent prompts: %d" % len(missing_prompts))
+        print("missing instructions: %d" % len(missing_instructions))
+    return 0 if res["ok"] else 1
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        prog="ecc-opencode-agent-complete",
+        description="Find and fill the OpenCode agent-conversion gap in ECC.")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    c = sub.add_parser("check", help="report the conversion gap (exit 1 on gap)")
+    c.add_argument("--repo", required=True)
+    c.add_argument("--config", default=".opencode/opencode.json")
+    c.add_argument("--json", action="store_true")
+    c.set_defaults(func=cmd_check)
+
+    e = sub.add_parser("emit", help="write a complete config + agent prompts")
+    e.add_argument("--repo", required=True)
+    e.add_argument("--out", required=True)
+    e.add_argument("--config", default=".opencode/opencode.json")
+    e.add_argument("--json", action="store_true")
+    e.set_defaults(func=cmd_emit)
+
+    v = sub.add_parser("verify-install", help="check an installed config resolves")
+    v.add_argument("--install", required=True)
+    v.add_argument("--json", action="store_true")
+    v.set_defaults(func=cmd_verify_install)
+
+    args = ap.parse_args(argv)
+    try:
+        return args.func(args)
+    except (OSError, ValueError, KeyError) as exc:
+        return fail(str(exc))
+
+
+if __name__ == "__main__":
+    sys.exit(main())
